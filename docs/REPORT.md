@@ -55,7 +55,12 @@ appear in the file:
   with a 5-minute expiry and an attempt counter in a new `otp_codes` table.
   `POST /api/auth/login` now verifies the submitted code against the hash,
   rejects expired/exceeded-attempt codes, and burns the code on success so
-  it can't be replayed. Codes are stored in Postgres rather than in-memory
+  it can't be replayed. bcrypt was chosen over a fast hash (e.g. SHA-256)
+  even though the OTP is short-lived and low-entropy (6 digits): bcrypt's
+  deliberate slowness is what makes brute-forcing the stored hash itself
+  expensive, and the added cost is negligible here since login is a
+  low-frequency, human-triggered action rather than a hot path like the
+  ping endpoint. Codes are stored in Postgres rather than in-memory
   specifically because the app will run as multiple replicas behind a load
   balancer (Container Apps) — an in-memory store would only work if the
   same replica handled both the OTP request and the login, which isn't
@@ -136,6 +141,10 @@ appear in the file:
   tracking/analytics.
 - *Fix:* added a `zod` schema validating types and realistic ranges
   (lat -90..90, lng -180..180, speed 0..400 km/h) before any DB write.
+  Chose a schema library over hand-written `if` checks because the
+  validation rules will likely grow (more fields, nested payloads for
+  batched pings) and a schema is self-documenting and easy to extend
+  without the branching logic becoming hard to follow.
 - *Verified:* a payload with `lat: 999` returns 400 with a clear error;
   a valid payload inserts correctly and is visible in `fleet_pings`.
 
