@@ -1,15 +1,26 @@
 {
   "name": "vexar-fleet-ping-service",
-  "version": "0.1.0",
-  "description": "VexarDrive Fleet Ping Service (assessment starter)",
+  "version": "0.2.0",
+  "description": "VexarDrive Fleet Ping Service",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"no tests configured\""
+    "test": "node --test test/",
+    "lint": "echo \"no linter configured - see docs/REPORT.md, Known Limitations\""
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5",
-    "jsonwebtoken": "^9.0.2"
+    "pino": "^9.3.2",
+    "pino-http": "^10.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "supertest": "^7.0.0"
   }
 }
