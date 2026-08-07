@@ -1,23 +1,44 @@
-version: "3.8"
+# Local development only. This file is never used in production - see
+# infra/ (Terraform) and docs/REPORT.md for the actual Azure deployment,
+# which uses Azure Database for PostgreSQL and Container Apps, not these
+# containers.
 
 services:
   app:
     build: .
     ports:
       - "3000:3000"
-    environment:
-      - NODE_ENV=production
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
-    image: postgres:15
+    image: postgres:16-alpine
+    # Was: "0.0.0.0:5432:5432" - bound the DB port to the whole host
+    # network, not just localhost. Anyone else on the same network could
+    # connect directly to the database. Bound to 127.0.0.1 only, and only
+    # because local tooling (psql, a DB GUI) may need direct access during
+    # development - the app itself talks to `db` over the internal Docker
+    # network via the DB_HOST env var, not this published port.
     ports:
-      - "0.0.0.0:5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
-      - POSTGRES_USER=vexaradmin
-      - POSTGRES_PASSWORD=V3xar@2024!Prod
-      - POSTGRES_DB=vexar_fleet
+      # Was: hardcoded password committed directly in this file. Now
+      # sourced from a local, git-ignored .env (see .env.example for the
+      # required keys). Never committed, never baked into an image.
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
   pgdata:
