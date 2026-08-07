@@ -1,0 +1,15 @@
+{
+  "name": "vexar-fleet-ping-service",
+  "version": "0.1.0",
+  "description": "VexarDrive Fleet Ping Service (assessment starter)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"no tests configured\""
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.11.5",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

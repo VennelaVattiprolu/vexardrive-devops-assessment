@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS drivers (
+  id SERIAL PRIMARY KEY,
+  phone VARCHAR(15) UNIQUE NOT NULL,
+  name VARCHAR(100),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_pings (
+  id SERIAL PRIMARY KEY,
+  vehicle_id VARCHAR(50) NOT NULL,
+  lat DECIMAL(9,6),
+  lng DECIMAL(9,6),
+  speed DECIMAL(5,2),
+  ts TIMESTAMP,
+  created_at TIMESTAMP DEFAULT NOW()
+);

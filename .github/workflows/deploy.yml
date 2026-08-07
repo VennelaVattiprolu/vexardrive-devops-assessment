@@ -1,0 +1,27 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Docker image
+        run: docker build -t vexar-fleet-ping:latest .
+
+      - name: Push to registry
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login vexaracr.azurecr.io -u vexaradmin --password-stdin
+          docker tag vexar-fleet-ping:latest vexaracr.azurecr.io/vexar-fleet-ping:latest
+          docker push vexaracr.azurecr.io/vexar-fleet-ping:latest
+
+      - name: Deploy to Azure Container Apps
+        run: |
+          az containerapp update \
+            --name vexar-fleet-ping \
+            --resource-group vexar-prod-rg \
+            --image vexaracr.azurecr.io/vexar-fleet-ping:latest
