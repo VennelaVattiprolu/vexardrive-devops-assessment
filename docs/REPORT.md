@@ -234,3 +234,142 @@ appear in the file:
 5. Partitioning or a time-series extension for `fleet_pings` once ping
    volume/fleet size crosses a threshold where the flat table + index
    stops being sufficient (see Deliverable 5).
+
+---
+
+## Deliverable 2: Containerization
+
+### Findings
+
+**1. Unpinned, oversized base image**
+- *Found:* `FROM node:latest`.
+- *Risk:* non-reproducible builds (the "latest" tag can silently point to
+  a different image tomorrow), and `node:latest` is a full Debian-based
+  image with build tools that are never needed at runtime — unnecessarily
+  large and a wider attack surface.
+- *Fix:* pinned to `node:20.17-alpine3.20`, and split the build into two
+  stages (`build` installs dependencies via `npm ci`; `runtime` copies
+  only `node_modules` and application code, discarding npm's cache and
+  any build-time-only files).
+- *Verified:* `docker images vexar-fleet-ping:test` → **207MB total image
+  size, 49.3MB unique content** on top of the shared Alpine base layers.
+
+**2. Broken layer caching**
+- *Found:* `COPY . .` ran before `npm install`.
+- *Risk:* every single code change (even a one-line edit to `server.js`)
+  invalidated the dependency-install layer, forcing a full `npm install`
+  on every build — slow CI, slow local iteration.
+- *Fix:* `package.json`/`package-lock.json` are copied and `npm ci` run
+  *before* the rest of the source is copied in, so the dependency layer
+  is only rebuilt when dependencies actually change.
+- *Verified:* observed in the build log — `[build 5/5] COPY . .` and the
+  runtime `COPY --chown=appuser:appgroup src ./src` steps show `CACHED`
+  on a rebuild after only touching application code, confirming the
+  dependency-install layer was reused.
+
+**3. Root user at runtime**
+- *Found:* no `USER` directive — the container ran as root by default.
+- *Risk:* if the app process were ever compromised (e.g. a future
+  dependency vulnerability), root inside the container is a meaningfully
+  worse starting position for an attacker than a scoped-down user.
+- *Fix:* added a dedicated `appuser`/`appgroup`, and the runtime stage
+  runs as that user.
+- *Verified:* `docker run --rm vexar-fleet-ping:test node -e
+  "console.log(process.getuid())"` → returned `100` (non-root), not `0`.
+
+**4. No signal handling for graceful shutdown**
+- *Found:* `node server.js` ran directly as PID 1 with no init process.
+- *Risk:* Node.js run as PID 1 does not reliably forward/handle
+  `SIGTERM` the way a normal process would, and doesn't reap zombie
+  processes. This would have silently undermined the graceful-shutdown
+  handler built in Deliverable 1 — `docker stop`/an orchestrator's
+  scale-down signal might never actually reach the app's shutdown logic.
+- *Fix:* added `tini` as the container's `ENTRYPOINT`, with `node
+  server.js` as its child command.
+- *Verified:* `docker run --rm vexar-fleet-ping:test ps aux` → PID 1 is
+  `/sbin/tini -- node server.js`, confirming correct signal forwarding is
+  in place.
+
+**5. No container health check**
+- *Found:* no `HEALTHCHECK` instruction.
+- *Risk:* `docker ps` / an orchestrator has no way to know the container
+  is actually able to serve traffic versus just having a running process.
+- *Fix:* added a `HEALTHCHECK` calling the real `/healthz` endpoint from
+  Deliverable 1.
+- *Verified:* `docker compose ps` shows both the `app` and `db`
+  containers as `healthy` after `docker compose up`.
+
+**6. Unnecessary attack surface**
+- *Found:* `EXPOSE 22` in the Dockerfile, despite no SSH server existing
+  anywhere in the image.
+- *Risk:* none directly (an unused `EXPOSE` doesn't open a port by
+  itself), but it's misleading boilerplate that suggests the image
+  supports SSH access when it doesn't, and needlessly widens the
+  documented/declared surface.
+- *Fix:* removed.
+
+**7. `docker-compose.yml` (local dev) network/secret exposure**
+- *Found:* Postgres was bound to `0.0.0.0:5432` (the entire host network,
+  not just localhost), with a hardcoded password committed directly in
+  the compose file.
+- *Risk:* anyone else on the same network as a developer's machine could
+  connect directly to the local Postgres instance. The hardcoded password
+  is also a bad habit that risks leaking into a real environment via
+  copy-paste.
+- *Fix:* bound to `127.0.0.1:5432` only (kept accessible for local tools
+  like `psql`/a DB GUI, but not the network), and credentials now come
+  from a git-ignored local `.env` file (`.env.example` documents the
+  required keys). Also added a healthcheck-gated `depends_on` so the app
+  container doesn't race the database being ready on startup.
+- *Verified:* `docker compose ps` shows the `db` service's port mapping
+  as `127.0.0.1:5432->5432/tcp`, not `0.0.0.0`.
+
+### Full end-to-end verification (against the actual built image)
+
+Unlike Deliverable 1 (verified against a bare Node process locally), this
+was verified against the **actual production Docker image**, run via
+`docker compose`, on a separate machine from where the image was built —
+closer to how it will really be deployed. Sequence performed:
+
+1. `docker build` — succeeded, 207MB image.
+2. Non-root user confirmed (`getuid()` → `100`).
+3. `tini` confirmed as PID 1.
+4. `docker compose up -d --build` — both `app` and `db` reached `healthy`
+   status.
+5. `GET /healthz` and `GET /readyz` — both `200`.
+6. Full OTP flow against the containerized app + containerized Postgres:
+   `request-otp` → OTP retrieved from container logs → `login` → valid
+   JWT returned.
+7. `GET /api/admin/drivers` with the admin token → `200`, correct data.
+8. `GET /api/admin/drivers` with a `driver`-role token → `403`.
+9. `GET /api/admin/drivers` with no token → `401`.
+10. `POST /api/fleet/ping` with a valid payload → `200`.
+11. `POST /api/fleet/ping` with `lat: 999` → `400`.
+
+All behaved identically to the non-containerized verification in
+Deliverable 1, confirming the containerization changes didn't alter
+application behavior — only how it's packaged and run.
+
+### What I chose not to change, and why
+
+- **Distroless or scratch-based images** — Alpine was chosen as a
+  reasonable middle ground between image size and having a usable shell
+  for debugging (`docker exec` into a running container). A distroless
+  image would be marginally smaller and reduce attack surface further,
+  but makes troubleshooting a live container meaningfully harder. Given
+  this is a small team's service (per the JD/company stage), the
+  debuggability trade-off favors Alpine.
+- **Docker Content Trust / image signing** — not configured for this
+  assessment; relevant once images are pushed through a real registry
+  pipeline (see Deliverable 4, CI/CD).
+
+### What I'd address next with more time
+
+1. Image vulnerability scanning wired into CI (Trivy/Grype) as an actual
+   pipeline gate, not just a manual `docker build` — see Deliverable 4.
+2. Resource limits (`mem_limit`/`cpus` in compose, and equivalent
+   requests/limits in the Azure Container Apps definition) — not set
+   here since local dev doesn't need them, but required for production.
+3. Multi-arch build (`linux/amd64` + `linux/arm64`) if the team ever
+   develops on Apple Silicon and wants local images to match prod
+   architecture exactly.
