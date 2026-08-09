@@ -487,3 +487,145 @@ in the interview if useful.
    PostgreSQL platform metrics into the Log Analytics workspace
    explicitly (currently relies on Container Apps' default log routing
    to the workspace it's created with).
+
+---
+
+## Deliverable 4: CI/CD Pipeline
+
+Full pipeline: `.github/workflows/deploy.yml`. Supporting identity/RBAC:
+`infra/cicd-identity.tf`. Setup steps to wire the two together:
+`infra/README.md`.
+
+### Findings and changes
+
+**1. No test or scan gate before deploy**
+- *Found:* the original workflow had one job — build, push, deploy —
+  triggered on every push to `main`, with no test step and no
+  vulnerability scanning.
+- *Risk:* any change, including a broken one, reached production
+  immediately. No mechanism catches a regression or a newly-disclosed
+  CVE in a base image/dependency before it ships.
+- *Fix:* pipeline now runs `test` (npm test + lint) → `build-and-scan`
+  (Docker build, then a Trivy scan that **fails the build** on
+  HIGH/CRITICAL vulnerabilities) before anything is pushed anywhere.
+  `build-and-scan` also runs on pull requests, so a reviewer sees
+  build/vulnerability feedback before merge, not just after.
+
+**2. Long-lived stored credential for registry access**
+- *Found:* the workflow authenticated to ACR with `${{
+  secrets.ACR_PASSWORD }}` — a long-lived admin password.
+- *Risk:* a static secret that, if leaked (log output, a compromised
+  runner, a misconfigured step), grants standing push access to the
+  registry until manually rotated.
+- *Fix:* replaced with OIDC — GitHub issues a short-lived, workflow-run-
+  scoped identity token; Azure exchanges it for an Azure AD token via a
+  federated credential (`infra/cicd-identity.tf`). There is no Azure
+  credential stored in GitHub at all, secret or otherwise — only
+  non-sensitive IDs (client ID, tenant ID, subscription ID) as
+  Environment *variables*.
+
+**3. No environment separation or deploy gating**
+- *Found:* one job, one target (hardcoded `vexar-prod-rg`), no concept
+  of a lower environment to validate a change in first.
+- *Risk:* every change's first real-world test is production.
+- *Fix:* `deploy`/`verify`/`rollback` are all tied to GitHub's
+  `environment:` key (`dev`/`staging`/`prod`, selected via
+  `workflow_dispatch` or defaulting to `dev` on push). This is what lets
+  GitHub Environment protection rules apply — specifically, the `prod`
+  environment should have **required reviewers** turned on (Settings →
+  Environments in the repo, documented in `infra/README.md`), which
+  pauses a production deploy for a human approval click. This setting is
+  **not expressible in the workflow YAML itself** — worth being explicit
+  about, since it'd be easy to imply the YAML alone enforces it.
+- *Scoped credentials per environment:* the federated credential's
+  `subject` in `infra/cicd-identity.tf` is scoped to
+  `environment:${var.environment}` — a workflow run targeting `dev`
+  cannot obtain a token for `prod`'s identity, even if someone tried to
+  point it there.
+
+**4. No real verification after deploy, no rollback path**
+- *Found:* the workflow considered itself done once `az containerapp
+  update` returned successfully — that command succeeding doesn't mean
+  the new revision is actually healthy.
+- *Risk:* a deploy that starts a container that immediately crash-loops
+  (bad env var, migration not applied, etc.) would show as a "successful"
+  GitHub Actions run while the service is actually down.
+- *Fix:* added a `verify` job that polls the live `/healthz` and
+  `/readyz` endpoints (up to 10 attempts, 10s apart) on the newly
+  deployed revision. If verification fails, a `rollback` job shifts 100%
+  traffic back to the last active revision.
+- *Design dependency surfaced by this work:* building this rollback step
+  is what made me go back and change `infra/containerapp.tf`'s
+  `revision_mode` from `Single` to `Multiple`. Single mode deactivates
+  the previous revision the moment a new one goes live, so "rollback"
+  would have meant a full rebuild-and-redeploy of the last known-good
+  image — slow, and defeats the purpose of a fast rollback path.
+  Multiple mode keeps the previous revision addressable, so rollback is
+  a traffic-weight shift, on the order of seconds. I'd originally left
+  this as `Single` with an unresolved "see README for why not Multiple"
+  comment when writing Deliverable 3 — working through the pipeline
+  design end-to-end is what surfaced that it was actually the wrong
+  call, and I've corrected it rather than leaving the inconsistency.
+
+**5. Overly broad CI permissions**
+- *Found:* N/A in the original (no identity/RBAC existed at all — it
+  used a shared admin credential with implicit full registry access).
+- *Fix, stated as a positive design choice:* the CI/CD identity is
+  granted `AcrPush` on the registry and `Container Apps Contributor`
+  scoped to the specific Container App — not `Contributor` on the whole
+  resource group. A compromised pipeline run cannot touch the database,
+  Key Vault, or networking, only push images and update this one app.
+
+### Verified
+
+- YAML syntax: parsed successfully with `yaml.safe_load` (Python) — all
+  6 jobs (`test`, `build-and-scan`, `push-image`, `deploy`, `verify`,
+  `rollback`) and all 3 triggers (`push`, `pull_request`,
+  `workflow_dispatch`) correctly recognized.
+- `yamllint`: clean except one intentional comment-indentation choice.
+- `npm run lint` (the actual command the `test` job runs): verified
+  working end-to-end locally — found and fixed two real issues (an
+  undefined global in `server.js`'s shutdown handler, an unused `catch`
+  binding), rather than just wiring up a linter that had nothing to
+  check yet.
+- **Not verified**: an actual GitHub Actions run against real Azure
+  credentials. This requires `terraform apply` to have run (so the
+  CI/CD identity and its federated credential exist) and the resulting
+  outputs to be set as GitHub Environment variables — both deliberately
+  out of scope per the same reasoning as Deliverable 3 (see that
+  section). The setup steps are fully documented in `infra/README.md` so
+  this is a "ready to run," not "designed but unclear how to run,"
+  state.
+
+### What I chose not to change, and why
+
+- **A separate `staging` promotion flow beyond the environment
+  selector** — e.g. automatically promoting a build that passed `dev`
+  into `staging` without a fresh trigger. The current design supports
+  three environments but each is triggered independently
+  (`workflow_dispatch` input); a true promotion pipeline (build once,
+  promote the same artifact through environments) is a meaningfully
+  larger design than this assessment's scope, and I'd rather ship a
+  correct, simpler three-environment design than an ambitious but
+  under-tested promotion flow.
+- **Canary/blue-green traffic splitting** — Multiple revision mode makes
+  this possible (`traffic_weight` already exists in `containerapp.tf`),
+  but I kept the deploy step as a full cutover (100% traffic to the new
+  revision immediately) rather than a gradual shift. Gradual rollout
+  adds real safety value at higher traffic volumes; at this service's
+  likely current scale, the added pipeline complexity (monitoring a
+  partial rollout, deciding shift timing/thresholds) isn't yet worth it
+  — this is a natural next step once real traffic volume justifies it.
+
+### What I'd address next with more time
+
+1. Actually run this against the real Azure subscription and fix
+   whatever the first live run surfaces (some drift between "should
+   work" and "does work" is normal for a first live CI/CD run).
+2. Real test coverage feeding the `test` job (see Deliverable 1).
+3. A genuine build-once-promote-everywhere pipeline instead of
+   independent per-environment triggers.
+4. Canary/gradual traffic shifting for production deploys specifically.
+5. Slack/Teams notification on rollback — right now a rollback is only
+   visible by checking the Actions run; an on-call engineer should be
+   paged/notified immediately (ties into Deliverable 7's alerting).
