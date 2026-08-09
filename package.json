@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "migrate:up": "node-pg-migrate up",
+    "migrate:down": "node-pg-migrate down",
+    "migrate:create": "node-pg-migrate create"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -22,6 +25,7 @@
   },
   "devDependencies": {
     "eslint": "^9.39.5",
+    "node-pg-migrate": "^9.0.0",
     "supertest": "^7.0.0"
   }
 }

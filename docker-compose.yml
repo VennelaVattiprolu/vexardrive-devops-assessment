@@ -2,6 +2,12 @@
 # infra/ (Terraform) and docs/REPORT.md for the actual Azure deployment,
 # which uses Azure Database for PostgreSQL and Container Apps, not these
 # containers.
+#
+# After first `docker compose up`, run `npm run migrate:up` (with
+# DATABASE_URL pointed at localhost:5432) to create the schema - was
+# previously auto-applied via docker-entrypoint-initdb.d/schema.sql;
+# replaced with tracked migrations (see migrations/) so local dev and
+# every real environment go through the exact same schema-change path.
 
 services:
   app:
@@ -13,7 +19,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-
   db:
     image: postgres:16-alpine
     # Was: "0.0.0.0:5432:5432" - bound the DB port to the whole host
@@ -33,7 +38,6 @@ services:
       - POSTGRES_DB=${DB_NAME}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 5s

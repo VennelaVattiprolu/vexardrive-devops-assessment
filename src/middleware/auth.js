@@ -22,7 +22,8 @@ function requireAuth(req, res, next) {
 }
 
 // Restricts a route to admin-role drivers. Requires requireAuth to have run first.
-// This introduces a `role` column on `drivers` (see schema.sql) rather than a
+// This introduces a `role` column on `drivers` (see
+// migrations/1754640000000_initial-schema.js) rather than a
 // separate hardcoded admin credential, so access can be revoked/granted per-user.
 function requireAdmin(req, res, next) {
   if (!req.driver || req.driver.role !== "admin") {

@@ -1,112 +1,115 @@
-# Fleet Ping Service
+# Fleet Ping Service — VexarDrive DevOps Assessment
 
-The Fleet Ping Service is a Node.js/Express backend service used to receive vehicle location updates and handle driver authentication.
+Node.js/Express backend receiving vehicle location pings and handling
+driver authentication, for VexarDrive's fleet management platform.
 
-The service uses PostgreSQL for persistent storage and is containerized using Docker.
+This repo is the completed submission for the VexarDrive DevOps & Cloud
+Infrastructure Engineer technical assessment. **The full write-up —
+what was found, what changed, why, and what was deliberately left
+unchanged — is in [`docs/REPORT.md`](docs/REPORT.md).** This README
+covers only how to actually run the thing.
 
-## Technology Stack
+## Technology stack
 
-* Node.js
-* Express.js
-* PostgreSQL
-* Docker
-* GitHub Actions
+- Node.js 20 / Express
+- PostgreSQL (via a connection pool — see `src/db.js`)
+- Docker (multi-stage, non-root, see `Dockerfile`)
+- Terraform for Azure (see `infra/`)
+- GitHub Actions for CI/CD (see `.github/workflows/deploy.yml`)
 
-## API Endpoints
+## API endpoints
 
-The service currently provides endpoints for:
+- `POST /api/auth/request-otp`, `POST /api/auth/login` — driver auth
+- `POST /api/fleet/ping` — vehicle location ping ingestion
+- `GET /api/admin/drivers` — admin-only driver list
+- `GET /healthz`, `GET /readyz` — liveness/readiness
 
-* Driver login
-* Vehicle location ping ingestion
-* Fleet ping retrieval
+See `src/routes/` for exact request/response shapes.
 
-Refer to the application source for endpoint definitions, request formats, and current behavior.
+## Local setup
 
-## Prerequisites
+**Fastest path — Docker Compose** (recommended, matches production closer):
 
-To run the service locally, ensure you have:
+```bash
+cp .env.example .env   # edit values as needed
+docker compose up --build
+npm run migrate:up      # DATABASE_URL should point at localhost:5432 for this
+```
 
-* Node.js
-* npm
-* PostgreSQL
-
-Alternatively, the application and database can be started using Docker Compose.
-
-## Local Setup
-
-Install dependencies:
+**Without Docker:**
 
 ```bash
 npm install
+cp .env.example .env   # point DB_HOST at your local Postgres
+npm run migrate:up
+npm start
 ```
-
-Configure the required environment variables using the provided environment configuration.
-
-Start the application:
-
-```bash
-node server.js
-```
-
-The service will start on the configured application port.
 
 ## Database
 
-The service uses PostgreSQL.
+Schema changes are tracked migrations in `migrations/` (via
+`node-pg-migrate`), not a hand-applied `.sql` file — see
+`docs/REPORT.md`, Deliverable 5, for why.
 
-The initial database structure is available in:
-
-```text
-schema.sql
+```bash
+npm run migrate:up      # apply all pending migrations
+npm run migrate:down    # roll back the most recent migration
+npm run migrate:create some-change-name   # scaffold a new migration
 ```
 
-Apply the schema to your local PostgreSQL instance before running the application.
+## Testing and linting
+
+```bash
+npm test    # see docs/REPORT.md, Deliverable 1, Known Limitations
+npm run lint
+```
 
 ## Docker
 
-The repository includes:
-
-```text
-Dockerfile
-docker-compose.yml
-```
-
-To start the application using Docker Compose:
-
 ```bash
-docker compose up --build
+docker build -t vexar-fleet-ping .
+docker compose up --build   # app + local Postgres together
 ```
 
-## Configuration
+## Infrastructure (Azure)
 
-Application configuration is managed through environment variables.
-
-Review the existing configuration and application source to determine the variables required to run the service.
+Terraform in `infra/` — see `infra/README.md` for how to run it,
+environment separation (`infra/environments/*.tfvars`), and how to wire
+the deployed identity into GitHub Actions.
 
 ## CI/CD
 
-A GitHub Actions workflow is included in the repository.
+`.github/workflows/deploy.yml` — test → build & scan → push → deploy →
+verify → rollback-on-failure. See `docs/REPORT.md`, Deliverable 4, and
+`infra/README.md` for the GitHub Environment setup this depends on.
 
-Changes pushed to the `main` branch currently trigger the configured deployment workflow.
-
-## Repository Structure
+## Repository structure
 
 ```text
 .
-├── .github/
-│   └── workflows/
+├── .github/workflows/deploy.yml   # CI/CD pipeline
+├── docs/
+│   └── REPORT.md                  # full technical report - start here
+├── infra/                         # Terraform (Azure)
+│   ├── environments/*.tfvars
+│   └── README.md
+├── migrations/                    # tracked schema changes
+├── src/
+│   ├── config.js
+│   ├── db.js
+│   ├── logger.js
+│   ├── middleware/
+│   └── routes/
+├── server.js
 ├── Dockerfile
 ├── docker-compose.yml
-├── schema.sql
-├── server.js
+├── eslint.config.js
 ├── package.json
 └── README.md
 ```
 
-## Assessment Context
+## Assessment context
 
-This repository is provided as part of the **VexarDrive Technologies DevOps & Cloud Infrastructure Engineer Technical Assessment**.
-
-Review the repository in its current state before making changes.
-
-Your assessment brief contains the requirements, expected deliverables, and submission instructions.
+Submitted for the VexarDrive Technologies DevOps & Cloud Infrastructure
+Engineer Technical Assessment. AI tool usage is disclosed in
+`docs/REPORT.md`.
