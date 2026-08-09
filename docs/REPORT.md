@@ -629,3 +629,158 @@ Full pipeline: `.github/workflows/deploy.yml`. Supporting identity/RBAC:
 5. Slack/Teams notification on rollback — right now a rollback is only
    visible by checking the Actions run; an on-call engineer should be
    paged/notified immediately (ties into Deliverable 7's alerting).
+
+---
+
+## Deliverable 5: Database Operations
+
+Most of the actual decisions here were made in Terraform (Deliverable 3)
+and the application code (Deliverable 1) — this section explains the
+reasoning and ties them together, rather than introducing new
+infrastructure.
+
+### Backup and point-in-time recovery
+
+Azure Database for PostgreSQL Flexible Server provides automated backups
+and PITR out of the box — this isn't something to build, only to
+configure correctly per environment (`infra/database.tf`):
+
+- **Retention**: 7 days for dev/staging, **30 days for prod**
+  (`backup_retention_days = var.environment == "prod" ? 30 : 7`). Dev
+  data has no real recovery value beyond a few days; prod data does.
+- **Geo-redundant backups**: enabled for prod only
+  (`geo_redundant_backup_enabled`). Protects against a full Azure region
+  outage, at roughly double backup storage cost — justified for prod,
+  not for dev.
+- **PITR mechanics**: Flexible Server continuously archives WAL, so
+  recovery can target any point within the retention window, not just
+  daily snapshot boundaries. In an incident (e.g. a bad migration or
+  accidental bulk delete), the response is: create a new server via
+  point-in-time restore to just before the bad event, verify the data,
+  then repoint the app's `DB_HOST` — Flexible Server PITR restores to a
+  **new** server rather than an in-place rollback, which is a deliberate
+  Azure design choice (it means a restore attempt can never itself
+  destroy the only copy of current data).
+
+### Connection management under bursty traffic
+
+This is the one place where a decision spans three separate files, so
+it's worth stating together:
+
+1. **App-level pooling** (`src/db.js`): a single `pg.Pool` per app
+   instance/replica, `max: 10` by default (`DB_POOL_MAX`). This was
+   Deliverable 1's fix for the original per-request `new Client()` bug.
+2. **Server-level ceiling** (`infra/database.tf`): `max_connections`
+   raised to 100 on the Postgres server, since the default for a
+   Burstable SKU is lower than what multiple app replicas × pool size
+   can need.
+3. **The arithmetic that connects them**: `replicas × DB_POOL_MAX` must
+   stay under `max_connections` with headroom for direct/admin
+   connections. At `max_replicas = 10` (prod) × `DB_POOL_MAX = 10` =
+   100 — which is exactly the ceiling, with zero headroom. **This is a
+   real gap I'm naming rather than glossing over**: either
+   `max_connections` needs to go higher (General Purpose SKUs support
+   more) or `DB_POOL_MAX` needs to scale down as replica count scales
+   up. I'd fix this before a real production rollout by making pool size
+   a function of expected max replica count, or introducing a connection
+   pooler (PgBouncer, or Azure's built-in pooling on newer Flexible
+   Server tiers) between the app and Postgres — see "what's next" below.
+
+### Access control and least privilege
+
+- **Application access**: the app connects as `vexaradmin` currently —
+  worth naming honestly as a simplification. A stricter design would use
+  a dedicated `app_user` role with `GRANT` limited to exactly the tables/
+  operations the app needs (`SELECT, INSERT, UPDATE` on its own tables,
+  no `DROP`/`ALTER`/`CREATE ROLE`), separate from the migration role
+  (which *does* need DDL rights). I didn't implement this role split for
+  this assessment given the remaining scope, but it's a concrete,
+  well-understood next step — not a hard problem, just one more piece.
+- **Network access control**: covered in depth in Deliverable 6 — the
+  database has no public endpoint at all, which is a stronger control
+  than any user-level permission could be.
+- **Human/operator access**: nobody should have a standing personal
+  Postgres login to production. Break-glass access should go through
+  Azure AD authentication to the database (Flexible Server supports
+  Azure AD-integrated auth) with just-in-time role assignment, logged via
+  Azure Activity Log — not a shared admin password.
+- **CI/migration access**: the migration role needs DDL rights
+  (`CREATE TABLE`, `ALTER TABLE`) that the app's runtime role should
+  never have — another argument for the role split above.
+
+### Schema changes / migrations
+
+Was: `schema.sql` applied by hand, once, with no record of which schema
+version any given environment was running — a real risk the moment
+there's more than one environment, since dev/staging/prod could
+silently drift apart with no way to detect it.
+
+Fixed: introduced `node-pg-migrate` (`migrations/`) — the original
+schema is now the first tracked migration
+(`1754640000000_initial-schema.js`), converted 1:1. `npm run migrate:up`
+is idempotent (safe to run on every deploy; a no-op if nothing's
+pending) and `npm run migrate:down` provides a tested rollback path.
+
+*Verified*: ran the full cycle against a real local Postgres — fresh
+`migrate:up` produces a schema identical to the old `schema.sql`
+(confirmed via `\d fleet_pings`), `migrate:down` cleanly drops
+everything it created, re-running `up` afterward correctly recreates it,
+and running `up` twice in a row on an already-migrated database is a
+correct no-op. The app was then booted against the migration-created
+schema and `/healthz`/`/readyz` both passed — confirming the migration
+produces a schema the app actually works against, not just one that
+looks structurally correct.
+
+### How this evolves with fleet size and ping volume
+
+- **Near-term (current design handles this)**: the index added in
+  Deliverable 1 (`fleet_pings(vehicle_id, ts DESC)`) keeps the common
+  "recent pings for vehicle X" query fast well past small-fleet volumes.
+- **Medium-term**: the connection-count math above becomes a real
+  constraint before the database itself is the bottleneck — this is the
+  first thing I'd revisit, via a pooler (PgBouncer) sitting between the
+  app and Postgres so replica count can scale independently of the
+  server's raw connection ceiling.
+- **Longer-term**: `fleet_pings` is an append-heavy, time-ordered table
+  that will eventually benefit from **partitioning by time** (e.g.
+  monthly partitions), which keeps the index working set small and makes
+  old-data retention/archival a cheap `DROP PARTITION` instead of a slow
+  `DELETE`. I'd introduce this once ping volume/fleet size data actually
+  shows the flat table becoming a problem, rather than pre-optimizing for
+  a scale that may not materialize — a genuinely bursty fleet workload
+  makes it hard to know the right partition boundary in advance without
+  real traffic data.
+- **SKU path**: Burstable → General Purpose (already reflected in
+  `environments/prod.tfvars`) once traffic is sustained rather than
+  spiky — Burstable throttles CPU after burst credits are exhausted,
+  which is a bad failure mode for continuous ping ingestion.
+
+### What I chose not to change, and why
+
+- **Role split (app role vs. migration role vs. admin role)** — named
+  above as a real gap. Not implemented here because it's a
+  straightforward, well-understood change I'd rather name honestly as
+  "not yet done" than rush and get subtly wrong (e.g. missing a
+  necessary grant and breaking the app) with the remaining deliverables
+  still ahead.
+- **Wiring `migrate:up` into the CI/CD pipeline** (Deliverable 4) — a
+  real production setup should run migrations as an explicit pipeline
+  step before traffic shifts to the new revision. I didn't add this to
+  `deploy.yml` because doing it safely needs more thought than a single
+  line (what happens if a migration fails mid-deploy? does it block the
+  deploy or roll back? is it safe to run concurrently with multiple
+  replicas starting up?) — deliberately left as a named next step rather
+  than a rushed, under-considered addition.
+
+### What I'd address next with more time
+
+1. App/migration/admin role split with least-privilege grants.
+2. PgBouncer (or Azure's built-in pooling) once the connection-count
+   math above becomes a real constraint.
+3. Migration step wired into CI/CD, with explicit failure handling.
+4. Time-based partitioning for `fleet_pings` once real volume data
+   justifies it.
+5. A tested restore drill (not just "PITR is configured") — actually
+   performing a point-in-time restore in a non-prod environment
+   periodically, since a backup strategy nobody has ever restored from
+   is unverified by definition.
