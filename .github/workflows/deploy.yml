@@ -1,27 +1,216 @@
-name: Deploy to Production
+# VexarDrive Fleet Ping Service - CI/CD
+#
+# Was: single job, no test/scan gate, pushed straight to prod on every
+# push to main, using a long-lived ACR admin password stored as a secret.
+# See docs/REPORT.md, Deliverable 4, for the full before/after reasoning.
+#
+# Pipeline: test -> build & scan -> push -> deploy -> verify -> (rollback
+# on verify failure). Deploy/verify/rollback run once per target
+# environment via the `environment:` key, which is what makes GitHub
+# Environment protection rules apply (see docs/REPORT.md - the
+# "production" environment's required-reviewer rule is configured in the
+# GitHub repo UI, not expressible in this YAML file itself).
+
+name: CI/CD
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging, prod]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: vexar-fleet-ping
 
 jobs:
-  deploy:
+  # --- Test ------------------------------------------------------------
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t vexar-fleet-ping:latest .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
 
-      - name: Push to registry
+      - run: npm ci
+
+      - run: npm test
+        # NOTE: npm test is currently a placeholder (see docs/REPORT.md,
+        # Deliverable 1, Known Limitations) - this gate is wired up and
+        # ready for real tests to be added, but does not yet catch
+        # regressions on its own. Documented honestly rather than
+        # implying more coverage than exists.
+
+      - run: npm run lint
+
+  # --- Build & scan ------------------------------------------------------
+  # Runs on every push AND every PR (unlike push/deploy below), so a pull
+  # request gets build + vulnerability feedback before merge, without
+  # needing any Azure credentials.
+  build-and-scan:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/[email protected]
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "table"
+          # Fails the build on HIGH/CRITICAL findings - a scan that never
+          # blocks anything isn't a gate, it's a report nobody reads.
+          exit-code: "1"
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true  # don't fail on vulns with no available fix yet - nothing actionable to do about those today
+
+      - name: Save image for downstream jobs
+        run: docker save ${{ env.IMAGE_NAME }}:${{ github.sha }} -o /tmp/image.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # --- Push to ACR (main branch only - PRs stop after build-and-scan) ---
+  push-image:
+    needs: build-and-scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      id-token: write  # required for OIDC federated login - no stored credential
+      contents: read
+    outputs:
+      image_uri: ${{ steps.tag.outputs.image_uri }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - run: docker load -i /tmp/image.tar
+
+      # OIDC login - was: docker login with an admin username/password
+      # stored as a GitHub secret. This exchanges GitHub's own short-lived
+      # OIDC token for an Azure AD token via the federated credential
+      # defined in infra/cicd-identity.tf - nothing long-lived to leak.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push to ACR
+        id: tag
         run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login vexaracr.azurecr.io -u vexaradmin --password-stdin
-          docker tag vexar-fleet-ping:latest vexaracr.azurecr.io/vexar-fleet-ping:latest
-          docker push vexaracr.azurecr.io/vexar-fleet-ping:latest
+          az acr login --name ${{ vars.ACR_NAME }}
+          IMAGE_URI="${{ vars.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} "$IMAGE_URI"
+          docker push "$IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to Azure Container Apps
+  # --- Deploy ------------------------------------------------------------
+  # The `environment:` key is what ties this job to GitHub Environment
+  # protection rules configured in the repo's Settings > Environments -
+  # specifically, the "prod" environment should have "required reviewers"
+  # turned on there, so a deploy to production pauses for a human
+  # approval click before this job runs. That protection rule itself
+  # cannot be expressed in this workflow file - it's a repo-level setting.
+  deploy:
+    needs: push-image
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy new revision
         run: |
           az containerapp update \
-            --name vexar-fleet-ping \
-            --resource-group vexar-prod-rg \
-            --image vexaracr.azurecr.io/vexar-fleet-ping:latest
+            --name ${{ vars.CONTAINER_APP_NAME }} \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --image ${{ needs.push-image.outputs.image_uri }}
+
+  # --- Verify --------------------------------------------------------------
+  # This is the gate that decides whether the deploy actually succeeded,
+  # not just whether `az containerapp update` returned exit code 0 - a
+  # command succeeding doesn't mean the app is healthy on the new revision.
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Smoke test /healthz and /readyz
+        run: |
+          URL="https://${{ vars.CONTAINER_APP_FQDN }}"
+          for i in $(seq 1 10); do
+            HEALTHZ=$(curl -s -o /dev/null -w "%{http_code}" "$URL/healthz" || echo "000")
+            READYZ=$(curl -s -o /dev/null -w "%{http_code}" "$URL/readyz" || echo "000")
+            echo "Attempt $i: healthz=$HEALTHZ readyz=$READYZ"
+            if [ "$HEALTHZ" = "200" ] && [ "$READYZ" = "200" ]; then
+              echo "Verification passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Verification failed after 10 attempts."
+          exit 1
+
+  # --- Rollback (only runs if verify fails) -------------------------------
+  rollback:
+    needs: [deploy, verify]
+    if: failure() && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Shift traffic back to the last known-good revision
+        run: |
+          PREVIOUS=$(az containerapp revision list \
+            --name ${{ vars.CONTAINER_APP_NAME }} \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --query "[?properties.trafficWeight==\`0\` && properties.active==\`true\`] | sort_by(@, &properties.createdTime) | [-1].name" \
+            -o tsv)
+
+          if [ -z "$PREVIOUS" ]; then
+            echo "No previous revision found to roll back to - manual intervention required."
+            exit 1
+          fi
+
+          echo "Rolling back to revision: $PREVIOUS"
+          az containerapp ingress traffic set \
+            --name ${{ vars.CONTAINER_APP_NAME }} \
+            --resource-group ${{ vars.RESOURCE_GROUP }} \
+            --revision-weight "$PREVIOUS=100"
