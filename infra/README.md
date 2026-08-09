@@ -72,6 +72,33 @@ retention period after destroy. `purge_soft_delete_on_destroy = true` in
 `providers.tf` handles this automatically for repeated demo/test
 destroy-and-recreate cycles.
 
+## Wiring up CI/CD (Deliverable 4)
+
+After `terraform apply`, the CI/CD workflow needs these values as GitHub
+**Environment variables** (not secrets — none of these are sensitive
+under OIDC) on the matching GitHub Environment (`dev`/`staging`/`prod`,
+created under repo **Settings → Environments**):
+
+```bash
+terraform output cicd_client_id
+terraform output azure_tenant_id
+terraform output azure_subscription_id
+terraform output acr_login_server        # also derive ACR_NAME (the part before .azurecr.io)
+terraform output resource_group_name
+terraform output container_app_name
+terraform output container_app_fqdn
+```
+
+Set as: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+`ACR_LOGIN_SERVER`, `ACR_NAME`, `RESOURCE_GROUP`, `CONTAINER_APP_NAME`,
+`CONTAINER_APP_FQDN`.
+
+**For the `prod` GitHub Environment specifically**, also enable
+"Required reviewers" under its protection rules (Settings →
+Environments → prod → Protection rules) — this is what actually pauses
+a production deploy for human approval; it's a repo setting, not
+something expressible in `.github/workflows/deploy.yml` itself.
+
 ## Cost note
 
 Every SKU choice in `environments/dev.tfvars` is deliberately the

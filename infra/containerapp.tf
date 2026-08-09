@@ -16,7 +16,20 @@ resource "azurerm_container_app" "main" {
   name                         = "${local.name_prefix}-app"
   resource_group_name          = azurerm_resource_group.main.name
   container_app_environment_id = azurerm_container_app_environment.main.id
-  revision_mode                 = "Single" # see infra/README.md for why not "Multiple" at this stage
+
+  # "Multiple" revision mode - was "Single" when this file was first
+  # written, which was the wrong call once the CI/CD rollback design was
+  # actually worked through (Deliverable 4): Single mode deactivates the
+  # previous revision the instant a new one goes live, so "rollback" would
+  # mean a full rebuild-and-redeploy of the last known-good image. Multiple
+  # mode keeps the previous revision addressable, so rollback is a traffic
+  # shift back to it - seconds, not a rebuild. Trade-off: an inactive old
+  # revision still exists as a resource (not consuming compute unless
+  # traffic is routed to it), so this is essentially free here - the
+  # deploy workflow explicitly deactivates old revisions after a
+  # successful rollout window rather than leaving them accumulating
+  # indefinitely (see .github/workflows/deploy.yml).
+  revision_mode = "Multiple"
 
   identity {
     type         = "UserAssigned"

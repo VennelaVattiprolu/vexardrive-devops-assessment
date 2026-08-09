@@ -14,7 +14,9 @@ function requireAuth(req, res, next) {
   try {
     req.driver = jwt.verify(token, config.jwt.secret);
     return next();
-  } catch (err) {
+  } catch (_err) {
+    // Deliberately not logging the raw error here (could contain parts of
+    // the malformed/expired token) - just the generic 401 the client sees.
     return res.status(401).json({ error: "invalid or expired token" });
   }
 }

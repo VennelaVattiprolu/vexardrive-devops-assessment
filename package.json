@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/",
-    "lint": "echo \"no linter configured - see docs/REPORT.md, Known Limitations\""
+    "lint": "eslint ."
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -21,6 +21,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "eslint": "^9.39.5",
     "supertest": "^7.0.0"
   }
 }
