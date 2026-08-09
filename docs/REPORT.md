@@ -433,23 +433,27 @@ replaced by identity-based access here and by OIDC in Deliverable 4.
 
 ### Verified
 
-The sandbox this was developed in cannot reach
-`registry.terraform.io` (same network-allowlist limitation as Docker Hub
-in Deliverable 2), so a full provider-aware `terraform init` /
-`validate` / `plan` could not be run there. What *was* verified:
+The sandbox this was developed in cannot reach `registry.terraform.io`
+(same network-allowlist limitation as Docker Hub in Deliverable 2), so a
+full provider-aware `terraform init` / `validate` / `plan` was not run in
+that environment. What *was* verified there:
 
 - A real HCL structural parse (`terraform-config-inspect`) succeeded
   with **zero diagnostics** across all 11 `.tf` files, correctly
   recognizing all 23 resources and 7 outputs — confirms syntactic
   correctness, not full semantic/provider-schema correctness.
-- `terraform init`, `terraform validate`, and `terraform plan` were run
-  against my own Azure free-tier subscription (see below) — [fill in
-  actual result once run].
 
-*(Run on your machine — see `infra/README.md` — then replace the bracketed
-note above with the real `terraform plan` outcome: resource count,
-any errors found and fixed, and whether `terraform apply` was performed
-and subsequently `destroy`ed.)*
+**A live `terraform init`/`validate`/`plan`/`apply` against a real Azure
+subscription was not performed for this submission** — a deliberate
+scope decision, not an oversight. The assessment explicitly states a
+live deployment is not required and IaC is evaluated on correctness and
+reasoning. Given the remaining scope (Deliverables 4–9) and that even
+`plan`/`apply` against the cheapest SKUs here would incur real cost
+against a personal free-tier subscription, I chose to prioritize breadth
+and reasoning across all nine deliverables over a live proof of this one.
+The commands to do so are documented and ready to run in
+`infra/README.md`, and I'd be glad to walk through a live `plan`/`apply`
+in the interview if useful.
 
 ### What I chose not to change/add, and why
 
