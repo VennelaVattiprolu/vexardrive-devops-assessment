@@ -918,3 +918,134 @@ network path).
    schedule; today rotation would be a manual `terraform apply` after
    changing the `random_password` resource's keeper, which works but
    isn't a documented, repeatable procedure yet.
+
+---
+
+## Deliverable 7: Monitoring & Observability
+
+### Health endpoint, readiness endpoint, structured logging
+
+Already built and verified in Deliverable 1 — not repeated here in
+full: `GET /healthz` (liveness, no DB dependency), `GET /readyz`
+(readiness, checks DB connectivity), and structured JSON logging via
+`pino` with automatic secret/PII redaction (`src/logger.js`). These are
+the foundation everything in this section is built on — the alerts
+below query the very log lines `pino`/`pino-http` already emit.
+
+### Alerts — what, trigger, why
+
+Six alerts (`infra/monitoring.tf`), deliberately kept narrow rather than
+exhaustive. Each one was chosen because it maps to a condition that
+would actually change what an on-call engineer does next — the goal
+stated in the brief ("meaningful observability rather than the number
+of monitoring tools configured") is the filter I used to cut anything
+that wouldn't clear that bar.
+
+**1. High error rate (5xx responses)**
+- *What:* percentage of requests returning HTTP 5xx, computed from the
+  app's own structured request logs.
+- *Trigger:* >5% of requests over a 5-minute window (ignoring windows
+  with fewer than 5 total requests, to avoid noise at low traffic).
+- *Why it matters:* the single most direct signal that something is
+  actively broken for real users/fleet devices right now — not a
+  leading indicator, an already-happening one. Severity 1 (urgent).
+
+**2. Sustained readiness-probe failures**
+- *What:* count of `/readyz` responses returning 503 (DB unreachable).
+- *Trigger:* 3+ in a 10-minute window — deliberately not 1, since a
+  single transient blip during a DB failover/restart is expected and
+  shouldn't page anyone; sustained failure is not.
+- *Why it matters:* catches the "app process is up but can't reach the
+  database" failure mode specifically — distinct from alert #1, since a
+  fully-down DB might not even generate enough request volume to trip
+  the error-rate threshold if traffic has nowhere to go.
+
+**3. Container App replica restarts**
+- *What:* `RestartCount` platform metric on the Container App.
+- *Trigger:* more than 3 restarts in a 15-minute window.
+- *Why it matters:* catches crash-loop behavior even when traffic is low
+  enough that it wouldn't otherwise show up as elevated error rate —
+  e.g. a bad deploy that crashes on startup before serving any requests
+  at all.
+
+**4. Database CPU sustained high**
+- *What:* `cpu_percent` on the PostgreSQL Flexible Server.
+- *Trigger:* average >80% over a 15-minute window.
+- *Why it matters:* the earliest warning sign before query latency and
+  connection saturation start affecting users directly — gives time to
+  react (scale up the SKU, investigate a runaway query) before it
+  becomes an outage rather than after.
+
+**5. Database connections approaching the configured ceiling**
+- *What:* `active_connections` on the PostgreSQL server.
+- *Trigger:* average >85, against `max_connections = 100`
+  (`database.tf`).
+- *Why it matters:* directly tied to the connection-count arithmetic
+  named honestly in Deliverable 5 (`max_replicas × DB_POOL_MAX` can
+  reach the configured ceiling with zero headroom). This is the alert
+  that would catch that gap *in production, before it causes connection
+  errors* — turning a documented risk into a monitored one rather than
+  leaving it as a silent assumption.
+
+**6. Spike in rate-limited auth attempts**
+- *What:* count of HTTP 429 responses from `/api/auth/login` and
+  `/api/auth/request-otp` — i.e., requests the rate limiter
+  (`src/middleware/rateLimit.js`) is actively throttling.
+- *Trigger:* >20 in a 15-minute window.
+- *Why it matters:* a security signal, not a reliability one. The rate
+  limiter already *prevents* brute-forcing on its own — this alert
+  exists so a human knows an attack is being attempted at all, since
+  "the defense worked" and "nobody noticed an attack happened" shouldn't
+  be the same outcome.
+
+### Design note: log-based vs. metric-based alerts
+
+Alerts #1, #2, #6 are **log-based** (KQL queries against
+`ContainerAppConsoleLogs_CL` — the table Container Apps automatically
+routes stdout/stderr into when wired to a Log Analytics workspace, as
+`containerapp.tf` does). Alerts #3, #4, #5 are **platform metric-based**
+(`azurerm_monitor_metric_alert` against the resource's own emitted
+metrics). This split isn't arbitrary: error rate, readiness failures,
+and auth abuse are all things only the *application* knows about (they
+require parsing what's inside a request/response, which only exists in
+app-level logs) — while restart count, CPU, and connection count are
+infrastructure-level facts Azure's platform already tracks natively as
+metrics, which is both cheaper (no log parsing) and lower-latency to
+evaluate than a KQL query would be for the same fact.
+
+### What I chose not to change/add, and why
+
+- **A dashboard** — the brief doesn't ask for one specifically, and
+  Azure Monitor Workbooks against the same Log Analytics workspace and
+  metrics would be straightforward to add, but building one meaningfully
+  requires deciding what an on-call engineer actually wants to see
+  first, which is better informed by real incidents than guessed at
+  upfront. I'd rather ship the alerts (which force a decision now) than
+  a dashboard (which can accumulate later, informed by what the alerts
+  actually catch).
+- **Distributed tracing / APM (Application Insights, OpenTelemetry)** —
+  genuinely valuable once there's more than one service to trace a
+  request across; for a single service, structured logs with a request
+  ID (already present via `pino-http`'s `req.id`) cover most of the same
+  debugging need at a fraction of the setup cost.
+- **A synthetic uptime check from outside Azure** (e.g. a third-party
+  ping service hitting the public endpoint) — the readiness/error-rate
+  alerts already catch "the app is broken," but not "the app is broken
+  *and* Azure Front Door/DNS/the whole region is unreachable," which
+  requires a check running from outside Azure's own infrastructure to
+  detect. Worth adding once the service has an SLA that makes that
+  distinction operationally meaningful.
+
+### What I'd address next with more time
+
+1. A dashboard, once real incidents have shown what's actually useful
+   to see at a glance.
+2. Distributed tracing if/when this becomes a multi-service system.
+3. A synthetic external uptime check.
+4. Tune every threshold above against real traffic data — every number
+   in this section (5% error rate, 3 restarts, 80% CPU, etc.) is a
+   reasonable starting point, not something validated against this
+   service's actual traffic patterns, since none exist yet.
+5. Route the CI/CD rollback event (Deliverable 4) into this same
+   action group, so a rollback pages on-call immediately rather than
+   only being visible by checking the Actions run.
