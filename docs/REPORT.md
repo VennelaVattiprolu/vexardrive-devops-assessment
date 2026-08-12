@@ -22,6 +22,16 @@ with the final call and understanding of trade-offs being mine.
 
 ---
 
+## Architecture at a glance
+
+![Architecture diagram](architecture.png)
+
+Full reasoning for every component and boundary shown here is in
+Deliverable 3 (compute/network/database design), Deliverable 6
+(secrets/identity/networking), and Deliverable 8 below.
+
+---
+
 ## Deliverable 1: Application Review & Production Readiness
 
 ### Approach to prioritization
@@ -1049,3 +1059,64 @@ evaluate than a KQL query would be for the same fact.
 5. Route the CI/CD rollback event (Deliverable 4) into this same
    action group, so a rollback pages on-call immediately rather than
    only being visible by checking the Actions run.
+
+---
+
+## Deliverable 8: Architecture Diagram
+
+See `docs/architecture.svg` / `docs/architecture.png`, also embedded at
+the top of this report under "Architecture at a glance."
+
+### What's shown and why
+
+- **Fleet vehicles / driver apps → Container Apps ingress**: the one
+  public entry point into the system, matching the network boundary
+  table in Deliverable 6.
+- **VNet boundary around Container Apps + PostgreSQL**: drawn as a
+  visual container specifically to make the private-database decision
+  legible at a glance — PostgreSQL sits inside the VNet with no line
+  connecting it to anything outside, because nothing outside can reach
+  it.
+- **ACR, Key Vault, Managed Identities as a separate column**: drawn
+  outside the VNet box (they have public management-plane endpoints,
+  access-gated by RBAC rather than network isolation) but still inside
+  the Resource Group boundary — visually distinguishing "network-private"
+  from "identity-private," which are different controls covered
+  separately in Deliverable 6.
+- **GitHub Actions → ACR / Container Apps, both labeled OIDC**: makes
+  the "no stored credential" design decision from Deliverable 4 visible
+  without requiring the reader to already know it.
+- **Log Analytics Workspace fed by both compute and database**: ties
+  directly to the six alerts detailed in Deliverable 7.
+- **The notes panel at the bottom** (network boundary summary + compute
+  choice) exists because a diagram alone can show *what* connects to
+  *what*, but not *why* those are the right boundaries — a few lines of
+  text alongside the diagram does that job better than trying to cram
+  the reasoning into box labels.
+
+### What I chose not to show, and why
+
+- **Every individual Terraform resource** (e.g. the private DNS zone,
+  the specific role assignments) — the diagram shows the architecturally
+  meaningful boundaries (public/private, which identity accesses what),
+  not a 1:1 map of every `.tf` resource. A diagram trying to show all 33
+  Terraform resources would be unreadable; `infra/` is the source of
+  truth for that level of detail.
+- **The dev/staging/prod environment triplication** — the diagram shows
+  one environment's shape, since all three share the identical
+  architecture (only SKU sizes/replica counts differ, per
+  `environments/*.tfvars`). Drawing three near-identical boxes side by
+  side would add visual noise without adding information.
+
+### Verified
+
+Rendered the SVG to PNG (`cairosvg`) and visually inspected it
+specifically for the failure mode described in the diagramming
+guidance I used — arrows crossing through unrelated boxes' text. Caught
+and fixed two: the original "pull image" and "read secrets" arrows cut
+diagonally through the PostgreSQL box's label text. Fixed by removing
+those cross-box arrows and stating the identity-based access as a note
+inside the Container Apps box instead, which is both cleaner and more
+accurate (it's not really a request/response arrow — it's "this
+component authenticates using its identity," which reads better as a
+property of the box than a directional arrow to another box).
