@@ -8,6 +8,169 @@ for the assessment. Each deliverable is a section below. Within each section,
 findings follow a consistent structure: **Found → Risk → Fix → Verified**, so
 the reasoning behind every change is traceable, not just the diff.
 
+**This is also Deliverable 9.** Rather than a separate document repeating
+what's below, this opening section is the synthesis the brief asks for —
+initial assessment, architecture decisions, trade-offs, security/database/
+deployment/monitoring approach, assumptions, limitations, cost, and
+scalability — each with a pointer to the deliverable section containing
+the full reasoning and verification. Everything stated here is backed by
+a Found→Risk→Fix→Verified entry somewhere below; nothing here is asserted
+without that backing.
+
+---
+
+## Executive Summary (Deliverable 9)
+
+### Initial assessment
+
+The starter repo was deliberately seeded with production-blocking issues
+(the code comments say so directly). Most serious: a complete
+authentication bypass (any OTP value was accepted), a SQL injection
+vector, an unauthenticated endpoint exposing all driver PII, and
+hardcoded production credentials committed to source. Beyond the
+security issues, the service had no health checks, no graceful shutdown,
+per-request database connections (which would exhaust Postgres under the
+JD's own "bursty fleet traffic" concern), and a Dockerfile/CI pipeline
+with no production hardening at all. Full detail: **Deliverable 1**.
+
+### Changes made, and why (summary)
+
+Every change is documented individually with Found/Risk/Fix/Verified in
+its deliverable section; at a high level: the application layer was
+fixed and re-architected slightly (real OTP flow, connection pooling,
+input validation, health endpoints, structured logging — **Deliverable
+1**); the container was rebuilt for production (multi-stage, non-root,
+tini, healthcheck — **Deliverable 2**); Azure infrastructure was
+designed in Terraform (Container Apps, private Postgres, Key Vault,
+managed identity — **Deliverable 3**); the CI/CD pipeline was rewritten
+around test/scan gates, OIDC auth, and a real rollback path
+(**Deliverable 4**); database operations (backup/PITR, connection
+management, migrations) were formalized (**Deliverable 5**); secrets/
+identity/networking were pulled into one explicit model
+(**Deliverable 6**); monitoring alerts were defined with what/trigger/
+why reasoning (**Deliverable 7**); and an architecture diagram ties it
+together visually (**Deliverable 8**).
+
+### Architecture decisions
+
+- **Azure Container Apps over AKS** — right-sized for a single service
+  and small team; explicitly named as revisitable if the system grows
+  into a multi-service platform. **Deliverable 3.**
+- **PostgreSQL Flexible Server, private-only access** — the single
+  highest-value network control in the whole design. **Deliverables
+  3, 6.**
+- **Two separate managed identities** (app runtime vs. CI/CD), neither
+  with resource-group-level `Contributor` — narrows blast radius for two
+  different compromise scenarios independently. **Deliverables 3, 6.**
+- **OIDC federated auth for CI/CD, zero stored Azure credentials** —
+  replaces the original long-lived ACR admin password entirely.
+  **Deliverable 4.**
+- **Tracked schema migrations (node-pg-migrate) over hand-applied SQL**
+  — added mid-assessment once the multi-environment risk became
+  concrete. **Deliverable 5.**
+
+### Important trade-offs (consolidated)
+
+The most important trade-offs from each deliverable's "what I chose not
+to change" section, together:
+
+| Trade-off | Chose | Over | Because |
+|---|---|---|---|
+| Compute | Container Apps | AKS | Team/service scale doesn't justify cluster ops overhead yet |
+| DB auth for app | Password via Key Vault | Azure AD-integrated | Already removes human exposure to the credential; AD auth is a smaller incremental gain |
+| Network isolation | Key Vault/ACR public + RBAC-gated | Private endpoints | Avoids needing VPN/bastion tooling the team doesn't have yet |
+| DB access control | Single `vexaradmin` role | App/migration/admin role split | Honest scope cut — well-understood, not implemented, rather than rushed |
+| Revision strategy | Full cutover on deploy | Canary/gradual traffic shift | Added pipeline complexity not yet justified at likely current traffic |
+| Testing | Manual, systematic, documented verification | Full automated test suite | Time budget across 9 deliverables; wired up and ready, not filled in |
+
+### Security approach
+
+No standing credentials anywhere in the system except two Terraform-
+generated secrets living only in Key Vault. Two independently-scoped
+managed identities. Database has no public network path at all. Full
+model: **Deliverable 6.**
+
+### Database strategy
+
+Pooled connections (app-side) against a sized `max_connections` ceiling
+(server-side) — with a real, named gap in the headroom math at max
+scale, and a stated fix path (pooler or dynamic pool sizing). Automated
+backups with PITR, retention tuned per environment. Migrations tracked
+and tested (up/down/idempotency all verified locally). Full detail:
+**Deliverable 5.**
+
+### Deployment strategy
+
+Test → build & scan → push → deploy → verify → rollback, gated per
+environment via GitHub Environments, with `prod` requiring human
+approval (configured in GitHub's UI, documented since it isn't
+expressible in the workflow YAML itself). Full detail: **Deliverable
+4.**
+
+### Monitoring approach
+
+Six alerts, each chosen because it changes what an on-call engineer does
+next — not "as many alerts as possible." Split between log-based (app-
+level facts: error rate, readiness failures, auth abuse) and metric-
+based (platform-level facts: restarts, CPU, connections). Full detail:
+**Deliverable 7.**
+
+### Assumptions and constraints
+
+- No live Azure deployment was performed — a deliberate, documented
+  scope decision (the assessment explicitly permits this), not an
+  oversight. Terraform and the CI/CD workflow were validated
+  structurally (HCL parse with zero diagnostics; YAML parse and lint)
+  rather than against a live subscription. **Deliverables 3, 4.**
+- Local development/testing (application logic, containerization,
+  database migrations) *was* performed against real running
+  instances — Postgres, Docker, and the full request/response cycle —
+  and is documented as such everywhere it happened.
+- Assumed a small-team, single-service company stage throughout (drives
+  the Container Apps decision, the "not yet" on private endpoints, the
+  "not yet" on a DB role split).
+
+### Known limitations (consolidated)
+
+The full, itemized "what I'd address next" list appears at the end of
+each deliverable section. The highest-priority items across all of them:
+1. Real automated test coverage (currently a wired-up placeholder).
+2. The connection-pool headroom gap at max replica count (Deliverable
+   5) — named honestly, not yet fixed.
+3. Live Azure validation of the Terraform and CI/CD pipeline.
+4. DB role split (app/migration/admin) for finer-grained least privilege.
+5. Private endpoints for Key Vault/ACR, once VPN/bastion tooling exists.
+
+### Cost considerations
+
+Every SKU choice in `environments/dev.tfvars` is the cheapest viable
+option (Burstable Postgres, `min_replicas = 0` scale-to-zero, Basic
+ACR) specifically to minimize spend against a free-tier subscription;
+`prod.tfvars` steps up to General Purpose Postgres and always-on
+replicas only where the always-on/HA trade-off is actually justified.
+Container Apps itself avoids the fixed cost of AKS's control-plane and
+node overhead. Full reasoning: **Deliverable 3** (`infra/README.md` has
+the explicit cost note and teardown instructions).
+
+### Scalability considerations
+
+Near-term: the `fleet_pings(vehicle_id, ts)` index (Deliverable 1)
+handles current query patterns well. Medium-term: the connection-count
+math becomes the first real constraint before the database itself does
+(Deliverable 5) — a pooler is the identified fix. Longer-term: time-
+based partitioning for `fleet_pings` once real volume data justifies it,
+and AKS becomes worth revisiting only if the system grows into multiple
+services. Full detail: **Deliverable 5**.
+
+### What I'd do next with more time
+
+In priority order: (1) real test coverage wired into the CI gate that
+already expects it, (2) a live `terraform apply` + full pipeline run
+against Azure to convert "structurally validated" into "proven end to
+end," (3) close the connection-pool headroom gap, (4) the DB role split,
+(5) private endpoints for Key Vault/ACR. Each is also listed in its
+originating deliverable's own "what's next" section with fuller context.
+
 ---
 
 ## AI Tool Usage Disclosure
